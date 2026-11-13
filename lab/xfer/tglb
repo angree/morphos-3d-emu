@@ -1,0 +1,24 @@
+; SPDX-License-Identifier: MIT
+; TGLBridge lab boot step: bring the network up (QEMU user net: rtl8139 -> eth1, DHCP from slirp),
+; fetch the real test script from the host (lab	glbserve.ps1, port 7660) and run it. Re-run: execute ide0:tglb
+failat 21
+copy ide0:tglbget RAM:tglbget
+protect RAM:tglbget rwed
+WaitForLib bsdsocket.library LOOP=3
+if warn
+  execute MOSSYS:S/network-startup
+endif
+WaitForLib bsdsocket.library LOOP=20
+; the live CD has no interface definition: create it, attach it, then DHCP
+echo "eth1 DEV=MOSSYS:Devs/Networks/rtl_8139pci.device UNIT=0" >ENV:sys/Interfaces
+IfConfig eth1 10.0.2.15 netmask 255.255.255.0 up
+NetConfig eth1 DHCP
+IfConfig eth1
+delete RAM:step quiet
+RAM:tglbget get 10.0.2.2 7660 step RAM:step
+if not exists RAM:step
+  wait 5
+  NetConfig eth1 DHCP
+  RAM:tglbget get 10.0.2.2 7660 step RAM:step
+endif
+execute RAM:step

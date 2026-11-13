@@ -1,0 +1,5 @@
+
+; morphos-3d-emu lab: autorun hook (only if the transfer disk has the script)
+if exists ide0:tglb-autorun
+  run >NIL: execute ide0:tglb-autorun
+endif

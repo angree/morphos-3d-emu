@@ -1,0 +1,4 @@
+; SPDX-License-Identifier: MIT
+; started from S:user-startup of the remastered ISO (run >NIL:); give Ambient time to come up
+wait 30
+execute ide0:tglb >RAM:autorun.log

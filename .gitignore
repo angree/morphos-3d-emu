@@ -1,0 +1,26 @@
+# Generated at build time from the MorphOS SDK headers installed on the build machine.
+# The MorphOS SDK may not be redistributed (SDK.readme, section 8), so these are never committed.
+bridge/guest/gen_*
+bridge/host/gen_*
+
+# Build outputs and lab run state
+bin/
+*.obj
+*.o
+*.log
+run/
+inbox/
+lab/xfer/tglbget
+shots*/
+
+# Never commit MorphOS, QEMU or other third-party binaries/data
+qemu/
+morphos/
+*.iso
+*.img
+*.lha
+*.zip
+*.exe
+*.dll
+sdkref/
+isoref/

@@ -1,0 +1,24 @@
+; SPDX-License-Identifier: MIT
+; TGLBridge test step 2: basic test, then the ~10k triangle stress test (served by the host)
+failat 21
+cd RAM:
+RAM:tglbget get 10.0.2.2 7660 tinygl.library RAM:tinygl.library
+RAM:tglbget get 10.0.2.2 7660 tglbtest RAM:tglbtest
+RAM:tglbget get 10.0.2.2 7660 tglbload RAM:tglbload
+protect RAM:tglbtest rwed
+protect RAM:tglbload rwed
+setenv TGLBRIDGE_LOG RAM:tglb.log
+setenv TGLBRIDGE_TRACE 0
+delete RAM:done.txt RAM:test2.log RAM:stress.log RAM:stress-nomirror.log quiet
+RAM:tglbload RAM:tinygl.library >RAM:load2.log
+setenv TGLBRIDGE_MIRROR 1
+RAM:tglbtest >RAM:test2.log
+RAM:tglbget put 10.0.2.2 7660 test2.log RAM:test2.log
+RAM:tglbtest stress 20 >RAM:stress.log
+RAM:tglbget put 10.0.2.2 7660 stress.log RAM:stress.log
+setenv TGLBRIDGE_MIRROR 0
+RAM:tglbtest stress 20 >RAM:stress-nomirror.log
+RAM:tglbget put 10.0.2.2 7660 stress-nomirror.log RAM:stress-nomirror.log
+RAM:tglbget put 10.0.2.2 7660 load2.log RAM:load2.log
+echo END >RAM:done.txt
+RAM:tglbget put 10.0.2.2 7660 done2.txt RAM:done.txt
