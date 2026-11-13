@@ -241,6 +241,59 @@ static int run_stress(struct Window *win, double secs)
 	return 0;
 }
 
+/* T73: the bug-B pattern - one CPU-side vertex buffer reused for every draw of the frame. A copy-at-call bridge
+ * shows 8x8 differently coloured quads; a driver that reads client arrays late (TGLBRIDGE_STRICT 1) shows only the
+ * last quad's data, and the canary (32) counts the changed buffers. argv: reuse <secs> [tight] */
+static int run_reuse(struct Window *win, double secs, int tight)
+{
+	static struct vtx v[4];
+	static float txyz[12];
+	static unsigned char trgba[16];
+	static const unsigned short idx[6] = { 0, 1, 2, 0, 2, 3 };
+	int frames = 0, gx, gy, k;
+	double t0 = now_s(), t1;
+	(void)win;
+	glDisable(GL_TEXTURE_2D);
+	glDisable(GL_DEPTH_TEST);
+	glViewport(0, 0, W, H);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glEnableClientState(GL_COLOR_ARRAY);
+	if (tight) {
+		glVertexPointer(3, GL_FLOAT, 0, txyz);
+		glColorPointer(4, GL_UNSIGNED_BYTE, 0, trgba);
+	} else {
+		glVertexPointer(3, GL_FLOAT, sizeof(struct vtx), &v[0].x);
+		glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(struct vtx), v[0].rgba);
+	}
+	printf("reuse: 64 quads per frame from one %s scratch buffer, %.0f s\n", tight ? "tight" : "interleaved", secs);
+	do {
+		glClearColor(0, 0, 0.3f, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glMatrixMode(GL_MODELVIEW);
+		glLoadIdentity();
+		for (gy = 0; gy < 8; gy++)
+			for (gx = 0; gx < 8; gx++) {
+				float x0 = -0.95f + gx * 0.24f, y0 = -0.95f + gy * 0.24f, x1 = x0 + 0.2f, y1 = y0 + 0.2f;
+				float xs[4] = { x0, x1, x1, x0 }, ys[4] = { y0, y0, y1, y1 };
+				for (k = 0; k < 4; k++) {
+					unsigned char r = (unsigned char)(gx * 32 + 31), g = (unsigned char)(gy * 32 + 31), b = (unsigned char)(k * 60);
+					v[k].x = xs[k]; v[k].y = ys[k]; v[k].z = 0; v[k].u = 0; v[k].v = 0;
+					v[k].rgba[0] = r; v[k].rgba[1] = g; v[k].rgba[2] = b; v[k].rgba[3] = 255;
+					txyz[k * 3] = xs[k]; txyz[k * 3 + 1] = ys[k]; txyz[k * 3 + 2] = 0;
+					trgba[k * 4] = r; trgba[k * 4 + 1] = g; trgba[k * 4 + 2] = b; trgba[k * 4 + 3] = 255;
+				}
+				glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, idx);
+			}
+		glASwapBuffers();
+		frames++;
+		t1 = now_s();
+	} while (t1 - t0 < secs);
+	printf("reuse: %d frames, glGetError 0x%x\n", frames, (unsigned)glGetError());
+	glDisableClientState(GL_COLOR_ARRAY);
+	glDisableClientState(GL_VERTEX_ARRAY);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct Window *win;
@@ -258,7 +311,9 @@ int main(int argc, char **argv)
 	printf("window %p GLAInitializeContextWindowed -> %d\n", win, ok);
 	if (ok) {
 		GLASetSync(__tglContext, 0);
-		if (argc > 1 && !strcmp(argv[1], "stress"))
+		if (argc > 1 && !strcmp(argv[1], "reuse"))
+			rc = run_reuse(win, argc > 2 ? atof(argv[2]) : 6.0, argc > 3 && !strcmp(argv[3], "tight"));
+		else if (argc > 1 && !strcmp(argv[1], "stress"))
 			rc = run_stress(win, argc > 2 ? atof(argv[2]) : 10.0);
 		else
 			rc = run_basic(win);

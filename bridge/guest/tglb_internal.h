@@ -21,6 +21,22 @@ struct tglb_array {
 	int sent;               /* uploaded for the current lock */
 };
 
+/* T73: one draw call that is deferred (lazy reads) and/or watched (canary) until the next flush point */
+struct tglb_pend {
+	unsigned int off;                 /* offset in c->buf where the draw belongs in the stream */
+	int kind;                         /* 0 glDrawElements, 1 glDrawArrays, 2 glArrayElement */
+	int emitted;                      /* already serialised at the call (canary-only record) */
+	int hi_given;                     /* lo/hi are final (glDrawRangeElements, or indices not copied) */
+	unsigned int mode, type, lo, hi;
+	int count, first;
+	const void *idx;                  /* client index pointer (lazy) or idx_copy */
+	void *idx_copy;
+	struct tglb_array arr[ARR_COUNT];
+	int locked, lock_first, lock_count;
+	unsigned int sum[ARR_COUNT + 1];  /* canary: arrays + [ARR_COUNT] = indices */
+	unsigned int draw_no;             /* draw number within the frame */
+};
+
 struct _GLContext {
 	unsigned int magic;               /* 'TGLB' */
 	struct Library *SocketBase;       /* opened by the task that called GLInit */
@@ -54,6 +70,26 @@ struct _GLContext {
 	char *str_val[TGLB_NSTR];
 
 	unsigned char unimpl_sent[(TGLB_NSLOTS + 7) / 8];
+
+	/* T73 strict mode (ENV:TGLBRIDGE_STRICT) */
+	unsigned int strict;
+	struct tglb_pend *pend;
+	int npend, pend_cap;
+	int in_resolve;
+	unsigned char *buf2;              /* serialisation buffer while resolving deferred draws */
+	int owed;                         /* swap replies sent to the host and not read yet (STRICT_LAG_SWAP) */
+	int swaps_in_buf;                 /* OP_SWAPs still in c->buf (not sent yet) */
+	int lag_n;
+	int lazy_min;                     /* ENV:TGLBRIDGE_LAZYMIN: draws using fewer vertices are read at the call (0 = all lazy) */                        /* ENV:TGLBRIDGE_LAG frames the "driver" may run behind (default 3) */
+	unsigned int last_op;             /* last command in c->buf and its offset (-1 = gone/flushed) */
+	int last_off;
+	int split;                        /* the host got part of a command (buffer-full flush): no out-of-band queries */
+	unsigned long st_oob;
+	unsigned int draw_no;             /* draws in this frame */
+	unsigned long st_deferred, st_resolves, st_canary_bad, st_canary_draws, st_canary_frames;
+	unsigned long st_fr_bad, st_fr_deferred, st_fr_resolves, st_quirk;
+	unsigned int canary_logged;
+	unsigned int canary_seen[128];
 };
 
 /* globals of the library (set in LibInit, read-only afterwards) */
@@ -63,6 +99,9 @@ extern struct Library *CyberGfxBase;
 
 /* tglb_lib.c */
 void tglb_flush(GLContext *c);
+void tglb_resolve(GLContext *c);      /* tglb_manual.c: serialise deferred draws, check canaries */
+void tglb_strict_init(GLContext *c);  /* tglb_manual.c */
+void tglb_strict_free(GLContext *c);
 void tglb_send_raw(GLContext *c, const void *p, unsigned int n);
 int tglb_recv_raw(GLContext *c, void *p, unsigned int n);
 unsigned char *tglb_cmd(GLContext *c, unsigned int op, unsigned int payload);

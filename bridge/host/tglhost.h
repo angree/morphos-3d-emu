@@ -37,6 +37,12 @@ typedef struct Client {
 	unsigned long long bytes_in, bytes_last, cmds, cmds_last;
 	int dead;
 	int vsync;
+	/* T73 strict mode (OP_STRICT from the guest's ENV:TGLBRIDGE_STRICT) */
+	unsigned int strict, max_tex, tex_budget_kb;
+	unsigned int (*texlv)[16];          /* bytes per texture id and mip level */
+	unsigned int ntexlv;
+	unsigned long long tex_bytes, tex_peak;
+	unsigned int tex_refused_size, tex_refused_mem, max_idx_count, max_vcount, logged_idx;
 } Client;
 
 extern const char *const g_slot_name[];

@@ -169,3 +169,45 @@ the guest demo/test program.
 - `libdb-6.2.dll` (Berkeley DB, AGPL-3.0) is loaded indirectly by QEMU (through `libjack64.dll`); its full source
   is in the sources asset.
 - What this repository uses but does not contain, and where to get it: [THIRD-PARTY.md](THIRD-PARTY.md).
+
+## Strict mode ("real TinyGL" emulation, T73)
+
+The bridge normally copies client vertex arrays and indices at the draw call and the host renders spec-correct desktop
+GL. That hides a whole class of bugs that the real MorphOS TinyGL on a Radeon shows. `ENV:TGLBRIDGE_STRICT` (guest,
+read at `GLInit`, decimal or `0x` hex) switches on emulations one by one; the host logs the mode per connection
+(`client N: STRICT mode 0x..`).
+
+| bit | name (`tglb_proto.h`) | what the bridge does |
+|---|---|---|
+| `0x01` | `STRICT_LAZY_ARRAYS` | a draw only records the array pointers; guest memory is read at the next flush point (buffer full, `glFlush`, `glFinish`, swap, any call that returns a value, full queue of 8192 draws). A buffer the program rewrites after the draw renders with the new contents, as with a driver that reads client memory late. |
+| `0x02` | `STRICT_LAZY_INDICES` | the index array is read late too (implies `0x01`). Without it, indices are copied at the call. |
+| `0x04` | `STRICT_STRIDE_TCCOL` | texcoord / colour / normal arrays with a non-tight stride are read as if tight. **Assumption**, not a documented TinyGL behaviour (see below). |
+| `0x08` | `STRICT_STRIDE_XYZ` | the same for the vertex (position) array. Kept separate: the evidence says real TinyGL draws a strided position array correctly. |
+| `0x10` | `STRICT_LIMITS` | host side: `GL_MAX_TEXTURE_SIZE` = `TGLBRIDGE_MAXTEX` (default 2048), `glTexImage2D` larger than that fails with `GL_INVALID_VALUE`; a texture memory budget `TGLBRIDGE_TEXMB` (default 96 MB, 16-bit formats counted as 2 bytes/texel) makes uploads beyond it fail; index type / indices-per-call statistics are logged. |
+| `0x20` | `STRICT_CANARY` | checksums every enabled array (vertex range of the draw) and the indices at the draw call, and again at the flush point. A mismatch = the program changed memory a deferring driver may still read. Changes nothing on screen; works with or without `0x01`. Each changed buffer is logged once in `TGLBRIDGE_LOG`; every bad frame and every 100th frame send a line to the host log (`guest note: strict: CANARY BAD FRAME frame N bad_draws B draws D ...`). |
+| `0x40` | `STRICT_LAG_SWAP` | the swap does not wait for the host: up to `TGLBRIDGE_LAG` frames (default 3) stay queued, so deferred draws are read up to that many frames after the call (a card running behind with `GLASetSync(0)`). Queries that do not depend on drawing (gets, `glGenTextures`, `glGetError`) are answered out of band ahead of the queued frames. Implies `0x01`. |
+
+`TGLBRIDGE_LAZYMIN=N`: with `0x01`, draws that use fewer than N vertices are still read at the call (a driver that
+copies small batches into its command buffer and DMAs only large ones; see the validation notes).
+
+Host: `tglhost --shot-every N [--shot-from S]` saves every Nth frame of every client
+(`clientN_frameNNNNN.bmp`), for frame-by-frame comparisons from a static camera.
+
+`tglbtest reuse <secs> [tight]` draws 64 quads per frame from one CPU-side buffer that is rewritten between the draws
+(the bug-B pattern): 64 coloured quads with strict 0, only the last quad with `0x01`, canary hits with `0x20`.
+
+What is known and what is assumed:
+- The MorphOS SDK (`tgl/*.h`, autodocs) documents none of these behaviours. Each emulation is the plausible failure,
+  calibrated against the wow3d real-hardware reports; it is not a model of the R200 driver.
+- Stride: wow3d 3309 drew its baked terrain (one interleaved 24-byte vertex: xyz, uv, rgba at stride 24) as spiky
+  grey triangles on real TinyGL, while the original terrain (xyz stride 24, uv tight, no colours) was fine.
+
+Validation (QEMU lab, wow3d MorphOS, static camera in Goldshire, 2026-11-13):
+- Lazy reads + 3-frame lag (`0x61`): single-frame triangle shards from doodads on wow3d 3316 and 3318 (the real-Radeon
+  bug B). Gone with the 3319 fix (4-frame copy ring, indices and tight arrays copied, canary 0), and back with the
+  same binary set to the 3316 behaviour (`tgl_ring=2 tgl_idxcopy=0 tgl_copyall=0`).
+- Side effect: the UI overlay (16 quads per atlas from one reused tight buffer) is drawn wrong under any lazy mode, a
+  symptom real Radeons did not report. Real TinyGL probably copies small batches at the call; `TGLBRIDGE_LAZYMIN`
+  models that but has not been validated yet.
+- The stride emulation (bug A, wow3d 3309/3315) has not been validated against wow3d yet; it is only demonstrated with
+  `tglbtest`.

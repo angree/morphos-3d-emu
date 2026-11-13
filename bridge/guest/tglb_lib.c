@@ -11,6 +11,11 @@
  *   TGLBRIDGE_PORT   TCP port                     (default 7654)
  *   TGLBRIDGE_MIRROR copy every Nth frame back into the guest window (0 = off, default)
  *   TGLBRIDGE_LOG    file for the guest-side log  (default none; never put it on a vvfat disk)
+ *   TGLBRIDGE_STRICT strict / "real TinyGL" bitmask (T73, decimal or 0x hex; tglb_proto.h STRICT_*), default 0
+ *   TGLBRIDGE_MAXTEX max texture size reported and enforced with STRICT_LIMITS (default 2048)
+ *   TGLBRIDGE_TEXMB  texture memory budget in MB with STRICT_LIMITS (default 96, 0 = no budget)
+ *   TGLBRIDGE_LAG    frames the emulated driver may run behind with STRICT_LAG_SWAP (default 3)
+ *   TGLBRIDGE_LAZYMIN draws over fewer vertices than this are read at the call even in lazy mode (default 0)
  */
 #include "tglb_internal.h"
 #include <stdarg.h>
@@ -101,6 +106,15 @@ int tglb_getenv_int(const char *name, int def)
 	n = tglb_getenv_str(name, b, sizeof(b));
 	if (n <= 0) return def;
 	if (b[0] == '-') { neg = 1; i = 1; }
+	if (b[i] == '0' && (b[i + 1] == 'x' || b[i + 1] == 'X')) {
+		for (i += 2; ; i++) {
+			int d = b[i] >= '0' && b[i] <= '9' ? b[i] - '0' : b[i] >= 'a' && b[i] <= 'f' ? b[i] - 'a' + 10 :
+			        b[i] >= 'A' && b[i] <= 'F' ? b[i] - 'A' + 10 : -1;
+			if (d < 0) break;
+			v = v * 16 + d;
+		}
+		return neg ? -v : v;
+	}
 	for (; b[i] >= '0' && b[i] <= '9'; i++) v = v * 10 + (b[i] - '0');
 	return neg ? -v : v;
 }
@@ -271,14 +285,16 @@ int tglb_recv_raw(GLContext *c, void *p, unsigned int n)
 
 void tglb_flush(GLContext *c)
 {
+	if (c->npend && !c->in_resolve) { tglb_resolve(c); return; }   /* T73: deferred draws first */
 	if (c->used) tglb_send_raw(c, c->buf, c->used);
 	c->used = 0;
+	if (!c->in_resolve) { c->owed += c->swaps_in_buf; c->swaps_in_buf = 0; c->last_off = -1; c->split = 0; }
 }
 
 unsigned char *tglb_reserve(GLContext *c, unsigned int n)
 {
 	unsigned char *p;
-	if (c->used + n > TGLB_BUFSZ) tglb_flush(c);
+	if (c->used + n > TGLB_BUFSZ) { tglb_flush(c); if (!c->in_resolve) c->split = 1; }   /* T73: may be mid-command */
 	p = c->buf + c->used;
 	c->used += n;
 	return p;
@@ -288,9 +304,12 @@ unsigned char *tglb_reserve(GLContext *c, unsigned int n)
 unsigned char *tglb_cmd(GLContext *c, unsigned int op, unsigned int payload)
 {
 	unsigned int pad = (payload + 3) & ~3u;
-	unsigned char *p = tglb_reserve(c, 8 + pad);
+	unsigned char *p;
+	if (c->used + 8 + pad > TGLB_BUFSZ) tglb_flush(c);   /* a command boundary */
+	p = tglb_reserve(c, 8 + pad);
 	((unsigned int *)p)[0] = op;
 	((unsigned int *)p)[1] = pad;
+	if (!c->in_resolve) { c->last_op = op; c->last_off = (int)(p - c->buf); }
 	if (pad != payload) *(unsigned int *)(p + 8 + pad - 4) = 0;
 	return p + 8;
 }
@@ -300,7 +319,7 @@ void tglb_append(GLContext *c, const void *src, unsigned int n)
 	const unsigned char *s = src;
 	while (n) {
 		unsigned int room = TGLB_BUFSZ - c->used, k;
-		if (!room) { tglb_flush(c); room = TGLB_BUFSZ; }
+		if (!room) { tglb_flush(c); if (!c->in_resolve) c->split = 1; room = TGLB_BUFSZ; }
 		k = n < room ? n : room;
 		tglb_memcpy(c->buf + c->used, s, k);
 		c->used += k; s += k; n -= k;
@@ -317,7 +336,22 @@ void tglb_pad(GLContext *c, unsigned int n)
 unsigned int tglb_reply_begin(GLContext *c)
 {
 	unsigned int len = 0;
-	tglb_flush(c);
+	/* T73 STRICT_LAG_SWAP: a query that does not depend on the drawing (gets, gen textures, errors) is sent on its own,
+	 * ahead of the buffered frame(s), as a driver with a command queue would answer it without draining the queue */
+	if ((c->strict & STRICT_LAG_SWAP) && c->npend && c->last_off >= 0 && !c->split && c->last_op != OP_SWAP && c->last_op != OP_CREATE &&
+	    c->last_op != OP_HELLO && c->last_op != SLOT_GLFinish && c->last_op != SLOT_GLReadPixels) {
+		tglb_send_raw(c, c->buf + c->last_off, c->used - (unsigned int)c->last_off);
+		c->used = (unsigned int)c->last_off;
+		c->last_off = -1;
+		c->st_oob++;
+	} else
+		tglb_flush(c);
+	while (c->owed > 0) {             /* T73 STRICT_LAG_SWAP: replies of swaps that did not wait */
+		c->owed--;
+		if (tglb_recv_raw(c, &len, 4) < 0) return 0;
+		tglb_reply_skip(c, len);
+		len = 0;
+	}
 	if (tglb_recv_raw(c, &len, 4) < 0) return 0;
 	return len;
 }
@@ -457,6 +491,7 @@ GLContext *tglb_connect(void)
 		CloseSocket(c->sock); CloseLibrary(SocketBase); FreeVec(c->buf); FreeVec(c); return NULL;
 	}
 	tglb_log("tglbridge: connected to %s:%ld (vector slots patched: %ld)", host, (long)port, (long)tglb_vec_patched);
+	tglb_strict_init(c);
 	if (tglb_vec_patched) {
 		char m[80]; int k = 0; const char *t = "guest: jump table slots patched after MakeLibrary";
 		while (t[k] && k < 79) { m[k] = t[k]; k++; } m[k] = 0;
@@ -472,7 +507,9 @@ void tglb_disconnect(GLContext *c)
 	if (!c->dead) {
 		tglb_cmd(c, OP_BYE, 0);
 		tglb_flush(c);
+		while (c->owed > 0) { unsigned int n = 0; c->owed--; if (tglb_recv_raw(c, &n, 4) < 0) break; tglb_reply_skip(c, n); }
 	}
+	tglb_strict_free(c);
 	CloseSocket(c->sock);
 	CloseLibrary(SocketBase);
 	for (i = 0; i < TGLB_NSTR; i++) if (c->str_val[i]) FreeVec(c->str_val[i]);

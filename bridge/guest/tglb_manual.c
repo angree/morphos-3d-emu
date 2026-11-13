@@ -369,27 +369,37 @@ void m_GLUnlockArraysEXT(GLContext *c)
 	for (i = 0; i < ARR_COUNT; i++) c->arr[i].sent = 0;
 }
 
-/* upload the enabled arrays for vertices [first, first+count) */
-static void send_arrays(GLContext *c, int first, int count)
+/* T73 strict mode: STRICT_STRIDE_* - real TinyGL (Radeon) drew interleaved arrays wrong (wow3d 3309/3315 terrain
+ * shards). The exact driver behaviour is unknown; the emulation reads a strided array as if it were tight. */
+static int quirk_tight(GLContext *c, int id)
+{
+	if (id == ARR_VERTEX) return (c->strict & STRICT_STRIDE_XYZ) != 0;
+	return (c->strict & STRICT_STRIDE_TCCOL) != 0;
+}
+
+/* upload the enabled arrays of `arr` for vertices [first, first+count); dedupe = use the per-lock `sent` flags */
+static void send_arrays_st(GLContext *c, struct tglb_array *arr, int locked, int lock_first, int lock_count,
+                           int dedupe, int first, int count)
 {
 	int i, use_lock = 0;
-	if (c->locked && first >= c->lock_first && first + count <= c->lock_first + c->lock_count) {
+	if (locked && first >= lock_first && first + count <= lock_first + lock_count) {
 		use_lock = 1;
-		first = c->lock_first;
-		count = c->lock_count;
+		first = lock_first;
+		count = lock_count;
 	}
 	for (i = 0; i < ARR_COUNT; i++) {
-		struct tglb_array *a = &c->arr[i];
+		struct tglb_array *a = &arr[i];
 		int ts, elem, stride, v;
 		unsigned int nbytes;
 		unsigned char *p;
 		const unsigned char *src;
 		if (!a->enabled || !a->ptr) continue;
-		if (use_lock && a->sent) continue;
+		if (dedupe && use_lock && a->sent) continue;
 		ts = type_size(a->type);
 		if (!ts) { tglb_unimpl(c, SLOT_GLVertexPointer); continue; }
 		elem = ts * a->size;
 		stride = a->stride ? a->stride : elem;
+		if (stride != elem && quirk_tight(c, i)) { stride = elem; c->st_quirk++; }
 		nbytes = (unsigned int)elem * count;
 		p = tglb_cmd(c, OP_ARRAY, 20);
 		((unsigned int *)(p - 8))[1] = 20 + ((nbytes + 3) & ~3u);
@@ -407,16 +417,18 @@ static void send_arrays(GLContext *c, int first, int count)
 			for (v = 0; v < count; v++) tglb_append(c, src + (unsigned int)v * stride, elem);
 		}
 		tglb_pad(c, nbytes);
-		a->sent = use_lock;
+		if (dedupe) a->sent = use_lock;
 	}
 }
 
-void m_GLDrawArrays(GLContext *c, GLenum mode, GLint first, GLsizei count)
+static void send_arrays(GLContext *c, int first, int count)
 {
-	unsigned char *p;
-	if (!CTXOK(c) || count <= 0) return;
-	send_arrays(c, first, count);
-	p = tglb_cmd(c, SLOT_GLDrawArrays, 12);
+	send_arrays_st(c, c->arr, c->locked, c->lock_first, c->lock_count, 1, first, count);
+}
+
+static void emit_drawarrays(GLContext *c, GLenum mode, GLint first, GLsizei count)
+{
+	unsigned char *p = tglb_cmd(c, SLOT_GLDrawArrays, 12);
 	p = tglb_put32(p, mode); p = tglb_put32(p, first); tglb_put32(p, count);
 }
 
@@ -437,26 +449,291 @@ static void index_range(GLenum type, const void *idx, int count, unsigned int *m
 	*mn = lo; *mx = hi;
 }
 
-static void draw_elements(GLContext *c, int slot, GLenum mode, unsigned int lo, unsigned int hi,
-                          GLsizei count, GLenum type, const void *idx)
+static int idx_size(GLenum type) { return type == 0x1403 ? 2 : type == 0x1405 ? 4 : 1; }
+
+static void emit_elements(GLContext *c, int slot, GLenum mode, GLsizei count, GLenum type, const void *idx)
 {
-	int isz = type == 0x1403 ? 2 : type == 0x1405 ? 4 : 1;
-	unsigned int nbytes = (unsigned int)count * isz;
-	unsigned char *p;
-	send_arrays(c, (int)lo, (int)(hi - lo + 1));
-	p = tglb_cmd(c, slot, 16);
+	unsigned int nbytes = (unsigned int)count * idx_size(type);
+	unsigned char *p = tglb_cmd(c, slot, 16);
 	((unsigned int *)(p - 8))[1] = 16 + ((nbytes + 3) & ~3u);
 	p = tglb_put32(p, mode); p = tglb_put32(p, count); p = tglb_put32(p, type); tglb_put32(p, nbytes);
 	tglb_append(c, idx, nbytes);
 	tglb_pad(c, nbytes);
 }
 
-void m_GLDrawElements(GLContext *c, GLenum mode, GLsizei count, GLenum type, const void *idx)
+static void draw_elements(GLContext *c, int slot, GLenum mode, unsigned int lo, unsigned int hi,
+                          GLsizei count, GLenum type, const void *idx)
+{
+	send_arrays(c, (int)lo, (int)(hi - lo + 1));
+	emit_elements(c, slot, mode, count, type, idx);
+}
+
+/* ------------------------------------------------------------------ T73 strict: deferred draws + canary */
+static unsigned int fnv(unsigned int h, const unsigned char *s, unsigned int n)
+{
+	while (n--) h = (h ^ *s++) * 16777619u;
+	return h;
+}
+
+static unsigned int sum_array(const struct tglb_array *a, unsigned int first, unsigned int count)
+{
+	unsigned int h = 2166136261u, elem, stride, v;
+	const unsigned char *s;
+	int ts = type_size(a->type);
+	if (!a->enabled || !a->ptr || !ts) return 0;
+	elem = (unsigned int)ts * a->size;
+	stride = a->stride ? (unsigned int)a->stride : elem;
+	s = a->ptr + first * stride;
+	if (stride == elem) return fnv(h, s, elem * count);
+	for (v = 0; v < count; v++, s += stride) h = fnv(h, s, elem);
+	return h;
+}
+
+/* the vertex range of a record (as seen at the draw call) */
+static void pend_range(const struct tglb_pend *p, unsigned int *lo, unsigned int *hi)
+{
+	if (p->kind == 1) { *lo = (unsigned int)p->first; *hi = (unsigned int)(p->first + p->count - 1); return; }
+	*lo = p->lo; *hi = p->hi;
+}
+
+static void pend_sums(const struct tglb_pend *p, unsigned int *out)
 {
 	unsigned int lo, hi;
-	if (!CTXOK(c) || count <= 0 || !idx) { if (CTXOK(c) && !idx && count > 0) tglb_unimpl(c, SLOT_GLDrawElements); return; }
-	index_range(type, idx, count, &lo, &hi);
+	int i;
+	pend_range(p, &lo, &hi);
+	for (i = 0; i < ARR_COUNT; i++) out[i] = hi >= lo ? sum_array(&p->arr[i], lo, hi - lo + 1) : 0;
+	out[ARR_COUNT] = p->kind == 0 ? fnv(2166136261u, p->idx, (unsigned int)p->count * idx_size(p->type)) : 0;
+}
+
+static struct tglb_pend *pend_new(GLContext *c)
+{
+	struct tglb_pend *p;
+	if (!c->pend) return NULL;
+	if (c->npend >= c->pend_cap) tglb_flush(c);   /* a full queue is a flush point */
+	p = &c->pend[c->npend++];
+	tglb_memset(p, 0, sizeof(*p));
+	p->off = c->used;
+	p->draw_no = c->draw_no;
+	tglb_memcpy(p->arr, c->arr, sizeof(p->arr));
+	p->locked = c->locked; p->lock_first = c->lock_first; p->lock_count = c->lock_count;
+	return p;
+}
+
+static const char *arr_name(int i)
+{
+	static const char *n[ARR_COUNT] = { "vertex", "color", "normal", "tex0", "tex1", "tex2", "tex3", "tex4", "tex5", "tex6", "tex7" };
+	return i < ARR_COUNT ? n[i] : "indices";
+}
+
+static void canary_check(GLContext *c, struct tglb_pend *p)
+{
+	unsigned int now[ARR_COUNT + 1];
+	int i, bad = 0;
+	pend_sums(p, now);
+	for (i = 0; i <= ARR_COUNT; i++) {
+		if (now[i] == p->sum[i]) continue;
+		bad++;
+		{   /* log each changed buffer (array kind + address) once: up to 128 different ones */
+			unsigned int lo, hi, key, k;
+			const struct tglb_array *a = i < ARR_COUNT ? &p->arr[i] : NULL;
+			key = (unsigned int)(a ? (unsigned long)a->ptr : (unsigned long)p->idx) ^ (unsigned int)i;
+			for (k = 0; k < c->canary_logged && c->canary_seen[k] != key; k++) ;
+			if (k < c->canary_logged || c->canary_logged >= 128) continue;
+			c->canary_seen[c->canary_logged++] = key;
+			pend_range(p, &lo, &hi);
+			tglb_log("tglbridge strict: CANARY frame %lu draw %lu: %s %p (stride %ld, verts %lu..%lu, %ld indices) changed between the draw call and the flush",
+			         (unsigned long)c->swaps + 1, (unsigned long)p->draw_no, arr_name(i),
+			         a ? (void *)a->ptr : (void *)p->idx, a ? (long)a->stride : 0L, (unsigned long)lo, (unsigned long)hi,
+			         (long)p->count);
+		}
+	}
+	if (bad) { c->st_canary_bad++; c->st_fr_bad++; }
+	c->st_canary_draws++;
+}
+
+static void emit_pend(GLContext *c, struct tglb_pend *p)
+{
+	unsigned int lo, hi;
+	const void *idx = p->idx_copy ? p->idx_copy : p->idx;
+	if (p->kind == 1) {
+		send_arrays_st(c, p->arr, p->locked, p->lock_first, p->lock_count, 0, p->first, p->count);
+		emit_drawarrays(c, p->mode, p->first, p->count);
+		return;
+	}
+	if (!p->hi_given) index_range(p->type, idx, p->count, &lo, &hi);   /* lazy indices: the range of what is there now */
+	else { lo = p->lo; hi = p->hi; }
+	if (hi < lo) return;
+	send_arrays_st(c, p->arr, p->locked, p->lock_first, p->lock_count, 0, (int)lo, (int)(hi - lo + 1));
+	emit_elements(c, SLOT_GLDrawElements, p->mode, p->count, p->type, idx);
+}
+
+/* flush point: splice the deferred draws into the stream at their places, reading guest memory now */
+void tglb_resolve(GLContext *c)
+{
+	unsigned char *mainb = c->buf;
+	unsigned int used = c->used, pos = 0;
+	int k;
+	c->in_resolve = 1;
+	for (k = 0; k < c->npend; k++) {
+		struct tglb_pend *p = &c->pend[k];
+		if (c->strict & STRICT_CANARY) canary_check(c, p);
+		if (!p->emitted && c->buf2) {
+			if (p->off > pos) { tglb_send_raw(c, mainb + pos, p->off - pos); pos = p->off; }
+			c->buf = c->buf2; c->used = 0;
+			emit_pend(c, p);
+			tglb_flush(c);                         /* in_resolve: plain send of buf2 */
+			c->buf = mainb;
+		}
+		if (p->idx_copy) { FreeVec(p->idx_copy); p->idx_copy = NULL; }
+	}
+	if (used > pos) tglb_send_raw(c, mainb + pos, used - pos);
+	c->buf = mainb; c->used = 0; c->npend = 0;
+	c->in_resolve = 0;
+	c->owed += c->swaps_in_buf; c->swaps_in_buf = 0; c->last_off = -1; c->split = 0;
+	c->st_resolves++; c->st_fr_resolves++;
+}
+
+void tglb_strict_init(GLContext *c)
+{
+	unsigned char *p;
+	int maxtex, texmb;
+	c->strict = (unsigned int)tglb_getenv_int("TGLBRIDGE_STRICT", 0);
+	if (!c->strict) return;
+	if (c->strict & (STRICT_LAZY_INDICES | STRICT_LAG_SWAP)) c->strict |= STRICT_LAZY_ARRAYS;
+	maxtex = tglb_getenv_int("TGLBRIDGE_MAXTEX", 2048);
+	texmb = tglb_getenv_int("TGLBRIDGE_TEXMB", 96);
+	c->lag_n = tglb_getenv_int("TGLBRIDGE_LAG", 3);
+	c->lazy_min = tglb_getenv_int("TGLBRIDGE_LAZYMIN", 0);
+	if (c->lag_n < 1) c->lag_n = 1;
+	if (c->strict & (STRICT_LAZY_ARRAYS | STRICT_CANARY)) {
+		c->pend_cap = 8192;
+		c->pend = AllocVec(sizeof(struct tglb_pend) * c->pend_cap, MEMF_PUBLIC);
+		c->buf2 = AllocVec(TGLB_BUFSZ, MEMF_PUBLIC);
+		if (!c->pend || !c->buf2) {
+			if (c->pend) FreeVec(c->pend);
+			if (c->buf2) FreeVec(c->buf2);
+			c->pend = NULL; c->buf2 = NULL; c->pend_cap = 0;
+			c->strict &= ~(STRICT_LAZY_ARRAYS | STRICT_LAZY_INDICES | STRICT_CANARY | STRICT_LAG_SWAP);
+			tglb_log("tglbridge strict: no memory for the deferred-draw queue, lazy/canary off");
+		}
+	}
+	tglb_log("tglbridge strict: flags 0x%lx (lazy arrays %ld, lazy indices %ld, stride quirk tc/col %ld xyz %ld, limits %ld (max tex %ld, budget %ld MB), canary %ld, lag swap %ld frames %ld, lazy from %ld vertices)",
+	         (unsigned long)c->strict, (long)!!(c->strict & STRICT_LAZY_ARRAYS), (long)!!(c->strict & STRICT_LAZY_INDICES),
+	         (long)!!(c->strict & STRICT_STRIDE_TCCOL), (long)!!(c->strict & STRICT_STRIDE_XYZ), (long)!!(c->strict & STRICT_LIMITS),
+	         (long)maxtex, (long)texmb, (long)!!(c->strict & STRICT_CANARY), (long)!!(c->strict & STRICT_LAG_SWAP), (long)c->lag_n, (long)c->lazy_min);
+	p = tglb_cmd(c, OP_STRICT, 12);
+	p = tglb_put32(p, c->strict); p = tglb_put32(p, (unsigned int)maxtex); tglb_put32(p, (unsigned int)texmb * 1024u);
+}
+
+void tglb_strict_free(GLContext *c)
+{
+	int k;
+	for (k = 0; k < c->npend; k++) if (c->pend[k].idx_copy) FreeVec(c->pend[k].idx_copy);
+	c->npend = 0;
+	if (c->pend) FreeVec(c->pend);
+	if (c->buf2) FreeVec(c->buf2);
+	c->pend = NULL; c->buf2 = NULL;
+}
+
+static char *put_num(char *o, char *e, unsigned long v)
+{
+	char t[12];
+	int n = 0;
+	do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v && n < 12);
+	while (n && o < e) *o++ = t[--n];
+	return o;
+}
+
+/* per swap: a bad frame (canary) or every 100th swap -> guest log + a note in the host log */
+static void strict_frame(GLContext *c)
+{
+	if (!c->strict) return;
+	if (c->st_fr_bad) c->st_canary_frames++;
+	if (c->st_fr_bad || ((c->swaps % 100) == 0 && c->swaps)) {
+		const char *t = c->st_fr_bad ? "strict: CANARY BAD FRAME" : "strict: summary";
+		static const char *lbl[6] = { " frame ", " bad_draws ", " draws ", " total_bad ", " bad_frames ", " deferred " };
+		unsigned long v[6];
+		char m[200], *o = m, *e = m + sizeof(m) - 1;
+		int j;
+		tglb_log("tglbridge %s frame %lu: %lu of %lu draws changed before the flush; totals: deferred %lu, resolves %lu, early queries %lu, canary checked %lu bad %lu in %lu frames, stride-quirk arrays %lu",
+		         t, (unsigned long)c->swaps, c->st_fr_bad, (unsigned long)c->draw_no, c->st_deferred, c->st_resolves, c->st_oob,
+		         c->st_canary_draws, c->st_canary_bad, c->st_canary_frames, c->st_quirk);
+		v[0] = c->swaps; v[1] = c->st_fr_bad; v[2] = c->draw_no; v[3] = c->st_canary_bad; v[4] = c->st_canary_frames;
+		v[5] = c->st_deferred;
+		while (*t && o < e) *o++ = *t++;
+		for (j = 0; j < 6; j++) {
+			const char *l = lbl[j];
+			while (*l && o < e) *o++ = *l++;
+			o = put_num(o, e, v[j]);
+		}
+		*o = 0;
+		tglb_note(c, m);
+	}
+	c->st_fr_bad = 0; c->st_fr_deferred = 0; c->st_fr_resolves = 0;
+	c->draw_no = 0;
+}
+
+void m_GLDrawArrays(GLContext *c, GLenum mode, GLint first, GLsizei count)
+{
+	struct tglb_pend *p;
+	if (!CTXOK(c) || count <= 0) return;
+	c->draw_no++;
+	if ((c->strict & STRICT_LAZY_ARRAYS) && count >= c->lazy_min && (p = pend_new(c)) != NULL) {
+		p->kind = 1; p->mode = mode; p->first = first; p->count = count;
+		if (c->strict & STRICT_CANARY) pend_sums(p, p->sum);
+		c->st_deferred++; c->st_fr_deferred++;
+		return;
+	}
+	send_arrays(c, first, count);
+	emit_drawarrays(c, mode, first, count);
+	if ((c->strict & STRICT_CANARY) && (p = pend_new(c)) != NULL) {
+		p->kind = 1; p->mode = mode; p->first = first; p->count = count; p->emitted = 1;
+		pend_sums(p, p->sum);
+	}
+}
+
+/* lo/hi: have_range = known now; hi_given = final for the draw too (glDrawRangeElements) */
+static void elements(GLContext *c, GLenum mode, GLsizei count, GLenum type, const void *idx,
+                     unsigned int lo, unsigned int hi, int have_range, int hi_given)
+{
+	struct tglb_pend *p;
+	c->draw_no++;
+	if ((c->strict & STRICT_LAZY_ARRAYS) && c->lazy_min > 0 && !have_range) {
+		index_range(type, idx, count, &lo, &hi);
+		have_range = 1;
+	}
+	if ((c->strict & STRICT_LAZY_ARRAYS) && (!have_range || hi < lo || (int)(hi - lo + 1) >= c->lazy_min) &&
+	    (p = pend_new(c)) != NULL) {
+		p->kind = 0; p->mode = mode; p->count = count; p->type = type; p->idx = idx;
+		if (!have_range && (!(c->strict & STRICT_LAZY_INDICES) || (c->strict & STRICT_CANARY))) {
+			index_range(type, idx, count, &lo, &hi);
+			have_range = 1;
+		}
+		p->lo = lo; p->hi = hi;
+		p->hi_given = hi_given;
+		if (!(c->strict & STRICT_LAZY_INDICES)) {          /* indices read now, arrays later */
+			unsigned int n = (unsigned int)count * idx_size(type);
+			p->idx_copy = AllocVec(n + 4, MEMF_PUBLIC);
+			if (p->idx_copy) tglb_memcpy(p->idx_copy, idx, n);
+			p->hi_given = 1;                               /* range of the indices as they were at the call */
+		}
+		if (c->strict & STRICT_CANARY) pend_sums(p, p->sum);
+		c->st_deferred++; c->st_fr_deferred++;
+		return;
+	}
+	if (!have_range) index_range(type, idx, count, &lo, &hi);
 	draw_elements(c, SLOT_GLDrawElements, mode, lo, hi, count, type, idx);
+	if ((c->strict & STRICT_CANARY) && (p = pend_new(c)) != NULL) {
+		p->kind = 0; p->mode = mode; p->count = count; p->type = type; p->idx = idx; p->emitted = 1;
+		p->lo = lo; p->hi = hi;
+		pend_sums(p, p->sum);
+	}
+}
+
+void m_GLDrawElements(GLContext *c, GLenum mode, GLsizei count, GLenum type, const void *idx)
+{
+	if (!CTXOK(c) || count <= 0 || !idx) { if (CTXOK(c) && !idx && count > 0) tglb_unimpl(c, SLOT_GLDrawElements); return; }
+	elements(c, mode, count, type, idx, 0, 0, 0, 0);
 }
 
 void m_GLDrawRangeElements(GLContext *c, GLenum mode, GLuint start, GLuint end, GLsizei count,
@@ -464,7 +741,7 @@ void m_GLDrawRangeElements(GLContext *c, GLenum mode, GLuint start, GLuint end, 
 {
 	if (!CTXOK(c) || count <= 0 || !idx || end < start) return;
 	/* sent as a plain glDrawElements: the host does not need the hint */
-	draw_elements(c, SLOT_GLDrawElements, mode, start, end, count, type, idx);
+	elements(c, mode, count, type, idx, start, end, 1, 1);
 }
 
 void m_GLArrayElement(GLContext *c, GLint i)
@@ -600,6 +877,13 @@ void m_GLASwapBuffers(GLContext *c)
 	c->swaps++;
 	if (c->swaps <= 3) tglb_trace("swap %lu", (unsigned long)c->swaps);
 	mirror = c->mirror_every > 0 && (c->swaps % c->mirror_every) == 0 && CyberGfxBase && (c->win || c->scr);
+	strict_frame(c);
+	if ((c->strict & STRICT_LAG_SWAP) && !mirror && c->owed + c->swaps_in_buf < c->lag_n) {
+		/* T73: the swap returns at once; the deferred draws are read up to lag_n frames later */
+		tglb_put32(tglb_cmd(c, OP_SWAP, 4), 0);
+		c->swaps_in_buf++;
+		return;
+	}
 	tglb_put32(tglb_cmd(c, OP_SWAP, 4), mirror);
 	len = tglb_reply_begin(c);
 	if (len < 12) { tglb_reply_skip(c, len); return; }

@@ -30,6 +30,16 @@
 #define OP_ARRAY      0xF008  /* u32 id, u32 size, u32 type, u32 first, u32 count, data (tight) */
 #define OP_BYE        0xF009  /* (none) */
 #define OP_NOTE       0xF00A  /* u32 len, text  - guest diagnostic line for the host log */
+#define OP_STRICT     0xF00B  /* u32 flags, u32 max_texture_size, u32 texture_budget_kb (T73 strict mode) */
+
+/* T73 strict / "real TinyGL" mode: ENV:TGLBRIDGE_STRICT bitmask (guest), sent to the host with OP_STRICT */
+#define STRICT_LAZY_ARRAYS  0x01  /* client vertex arrays are read at the next flush point, not at the draw call */
+#define STRICT_LAZY_INDICES 0x02  /* the index array of glDrawElements is read late too (implies the range scan) */
+#define STRICT_STRIDE_TCCOL 0x04  /* texcoord/colour/normal arrays with a non-tight stride are read as if tight */
+#define STRICT_STRIDE_XYZ   0x08  /* the vertex (position) array with a non-tight stride is read as if tight */
+#define STRICT_LIMITS       0x10  /* host: max texture size, texture memory budget (uploads fail), index stats */
+#define STRICT_CANARY       0x20  /* checksum every array + indices at the draw and again at the flush; log changes */
+#define STRICT_LAG_SWAP     0x40  /* swap does not wait: late reads may happen up to one frame after the draw */
 
 #define ARR_VERTEX 0
 #define ARR_COLOR  1

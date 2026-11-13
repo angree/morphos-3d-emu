@@ -9,6 +9,9 @@
  *
  *   tglhost [--port 7654] [--hidden] [--shot 60,120] [--shotdir dir] [--log tglhost.log]
  *           [--exit-after N]   (exit after N guest connections have closed)
+ *           [--shot-every N] [--shot-from S]   (save every Nth frame of every client from swap S: frame-by-frame checks)
+ * Strict mode (guest ENV:TGLBRIDGE_STRICT, sent with OP_STRICT): STRICT_LIMITS is enforced here (max texture size,
+ * texture memory budget, index statistics); everything else is done by the guest library.
  *           [--glcheck]        (debug: glGetError after every command, first error per opcode logged;
  *                               this swallows errors the guest would otherwise see)
  */
@@ -59,7 +62,7 @@ static PFNCAT p_glClientActiveTexture;
 static FILE *g_log;
 static int g_glcheck;
 static int g_hidden, g_port = TGLB_DEFAULT_PORT, g_exit_after = -1, g_closed;
-static int g_shots[64], g_nshots;
+static int g_shots[64], g_nshots, g_shot_every, g_shot_from;   /* T73: --shot-every N [--shot-from S] */
 static char g_shotdir[MAX_PATH] = "shots";
 static HMODULE g_gl32, g_glu32;
 static void *g_fp[TGLB_NSLOTS];
@@ -330,6 +333,7 @@ static void client_free(Client *cl)
 	closesocket(cl->s);
 	for (i = 0; i < ARR_COUNT; i++) free(cl->abuf[i]);
 	free(cl->in);
+	free(cl->texlv);
 	free(cl);
 }
 
@@ -427,6 +431,84 @@ static const char *ext_string(void)
 	       "GL_EXT_texture_filter_anisotropic";
 }
 
+/* ------------------------------------------------------------------ T73 strict: real-TinyGL limits */
+/* bytes per texel as the card would store it (16-bit formats stay 16-bit, everything else 32-bit) */
+static unsigned int tex_bpp(GLint ifmt, GLenum type)
+{
+	switch (type) {
+	case 0x8363: case 0x8364: case 0x8033: case 0x8365: case 0x8034: case 0x8366: return 2;
+	}
+	switch (ifmt) {
+	case 0x8050: case 0x8D62: case 0x8056: case 0x8057: case 2: case 0x190A: return 2;   /* RGB5 RGB565 RGBA4 RGB5_A1 LA */
+	case 1: case 0x1906: case 0x1909: case 0x803C: case 0x8040: return 1;               /* L A ALPHA8 LUMINANCE8 */
+	}
+	return 4;
+}
+
+static unsigned int *tex_slot(Client *cl, GLuint id, int level)
+{
+	if (level < 0 || level > 15 || id == 0 || id > (1u << 20)) return NULL;
+	if (id >= cl->ntexlv) {
+		unsigned int n = cl->ntexlv ? cl->ntexlv : 1024;
+		void *q;
+		while (n <= id) n *= 2;
+		q = realloc(cl->texlv, (size_t)n * sizeof(*cl->texlv));
+		if (!q) return NULL;
+		memset((unsigned char *)q + (size_t)cl->ntexlv * sizeof(*cl->texlv), 0, (size_t)(n - cl->ntexlv) * sizeof(*cl->texlv));
+		cl->texlv = (unsigned int (*)[16])q;
+		cl->ntexlv = n;
+	}
+	return &cl->texlv[id][level];
+}
+
+/* returns 1 if the upload must fail (STRICT_LIMITS): too big, or over the texture memory budget */
+static int strict_tex_refuse(Client *cl, uint32_t target, int level, GLint ifmt, int w, int h, GLenum type)
+{
+	GLint bound = 0;
+	unsigned int *slot, need;
+	if (!(cl->strict & STRICT_LIMITS) || target != GL_TEXTURE_2D) return 0;
+	if ((unsigned int)w > cl->max_tex || (unsigned int)h > cl->max_tex) {
+		if (cl->tex_refused_size++ < 30)
+			hlog("client %d: strict: glTexImage2D %dx%d level %d is over the max texture size %u - upload fails (GL_INVALID_VALUE)",
+			     cl->id, w, h, level, cl->max_tex);
+		return 1;
+	}
+	glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &bound);
+	slot = tex_slot(cl, (GLuint)bound, level);
+	if (!slot) return 0;
+	need = (unsigned int)w * (unsigned int)h * tex_bpp(ifmt, type);
+	if (cl->tex_budget_kb && cl->tex_bytes - *slot + need > (unsigned long long)cl->tex_budget_kb * 1024u) {
+		if (cl->tex_refused_mem++ < 30)
+			hlog("client %d: strict: glTexImage2D tex %d %dx%d level %d (%u KB) does not fit the texture budget (%llu of %u KB used) - upload fails",
+			     cl->id, bound, w, h, level, need >> 10, cl->tex_bytes >> 10, cl->tex_budget_kb);
+		return 1;
+	}
+	cl->tex_bytes = cl->tex_bytes - *slot + need;
+	*slot = need;
+	if (cl->tex_bytes > cl->tex_peak) cl->tex_peak = cl->tex_bytes;
+	return 0;
+}
+
+static void strict_tex_delete(Client *cl, GLuint id)
+{
+	int l;
+	if (!cl->texlv || id == 0 || id >= cl->ntexlv) return;
+	for (l = 0; l < 16; l++) { cl->tex_bytes -= cl->texlv[id][l]; cl->texlv[id][l] = 0; }
+}
+
+static void strict_idx(Client *cl, GLsizei count, GLenum type)
+{
+	if ((unsigned int)count > cl->max_idx_count) cl->max_idx_count = (unsigned int)count;
+	if (type != GL_UNSIGNED_SHORT && !(cl->logged_idx & 1)) {
+		cl->logged_idx |= 1;
+		hlog("client %d: strict: glDrawElements with index type 0x%x (not GL_UNSIGNED_SHORT) - untested on real TinyGL", cl->id, type);
+	}
+	if (count > 65535 && !(cl->logged_idx & 2)) {
+		cl->logged_idx |= 2;
+		hlog("client %d: strict: glDrawElements with %d indices in one call (> 65535)", cl->id, (int)count);
+	}
+}
+
 /* returns 1 if handled */
 static int manual(Client *cl, int slot, unsigned char *p0, unsigned int len)
 {
@@ -454,10 +536,12 @@ static int manual(Client *cl, int slot, unsigned char *p0, unsigned int len)
 			GLint v[16];
 			glGetIntegerv(pn, v);
 			if (pn == 0x84E2 && v[0] > 8) v[0] = 8;   /* MAX_TEXTURE_UNITS: the guest tracks 8 */
+			if (pn == 0x0D33 && (cl->strict & STRICT_LIMITS) && (unsigned int)v[0] > cl->max_tex) v[0] = (GLint)cl->max_tex;
 			for (i = 0; i < n; i++) put_be32(out + 4 + i * 4, (uint32_t)v[i]);
 		} else if (slot == SLOT_GLGetFloatv) {
 			GLfloat v[16];
 			glGetFloatv(pn, v);
+			if (pn == 0x0D33 && (cl->strict & STRICT_LIMITS) && v[0] > (GLfloat)cl->max_tex) v[0] = (GLfloat)cl->max_tex;
 			for (i = 0; i < n; i++) { uint32_t u; memcpy(&u, &v[i], 4); put_be32(out + 4 + i * 4, u); }
 		} else if (slot == SLOT_GLGetBooleanv) {
 			GLboolean v[16];
@@ -486,7 +570,9 @@ static int manual(Client *cl, int slot, unsigned char *p0, unsigned int len)
 		data = has ? (unsigned char *)p : NULL;
 		if (data && (size_t)(p - p0) + nbytes > len) { hlog("short pixel payload"); return 1; }
 		if (data && esz > 1) swap_inplace(data, nbytes, esz);
-		if (slot == SLOT_GLTexImage2D)
+		if (slot == SLOT_GLTexImage2D && strict_tex_refuse(cl, f[0], (int)f[1], (GLint)f[2], (int)f[3], (int)f[4], f[7]))
+			glTexImage2D(f[0], f[1], f[2], -1, -1, f[5], f[6], f[7], NULL);   /* fails like the real one: GL_INVALID_VALUE */
+		else if (slot == SLOT_GLTexImage2D)
 			glTexImage2D(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], data);
 		else if (slot == SLOT_GLTexSubImage2D)
 			glTexSubImage2D(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], data);
@@ -540,7 +626,7 @@ static int manual(Client *cl, int slot, unsigned char *p0, unsigned int len)
 		GLuint t[256];
 		while (n > 0) {
 			int k = n > 256 ? 256 : n;
-			for (i = 0; i < k; i++) t[i] = rd_u32(&p);
+			for (i = 0; i < k; i++) { t[i] = rd_u32(&p); strict_tex_delete(cl, t[i]); }
 			glDeleteTextures(k, t);
 			n -= k;
 		}
@@ -566,6 +652,7 @@ static int manual(Client *cl, int slot, unsigned char *p0, unsigned int len)
 		unsigned char *idx = (unsigned char *)p;
 		if ((size_t)(p - p0) + nbytes > len) { hlog("short index payload"); return 1; }
 		swap_inplace(idx, nbytes, type == GL_UNSIGNED_SHORT ? 2 : type == GL_UNSIGNED_INT ? 4 : 1);
+		if (cl->strict & STRICT_LIMITS) strict_idx(cl, count, type);
 		glDrawElements(m, count, type, idx);
 		return 1;
 	}
@@ -593,6 +680,11 @@ static void do_swap(Client *cl, int mirror)
 	int i;
 	double t;
 	cl->swaps++;
+	if (g_shot_every > 0 && cl->swaps >= (unsigned int)g_shot_from && (cl->swaps % (unsigned int)g_shot_every) == 0) {
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s\\client%d_frame%05u.bmp", g_shotdir, cl->id, cl->swaps);
+		save_bmp(cl, path);
+	}
 	for (i = 0; i < g_nshots; i++)
 		if ((unsigned int)g_shots[i] == cl->swaps) {
 			char path[MAX_PATH];
@@ -631,6 +723,10 @@ static void do_swap(Client *cl, int mirror)
 		hlog("client %d: %.1f fps, %.0f KB/s in, %.0f cmds/frame (swap %u)", cl->id,
 		     (cl->swaps - cl->swaps_last) / dt, (cl->bytes_in - cl->bytes_last) / dt / 1024.0,
 		     (double)(cl->cmds - cl->cmds_last) / (cl->swaps - cl->swaps_last ? cl->swaps - cl->swaps_last : 1), cl->swaps);
+		if ((cl->strict & STRICT_LIMITS) && (cl->swaps / 50) != (cl->swaps_last / 50))
+			hlog("client %d: strict limits: textures %llu KB (peak %llu KB, budget %u KB), refused: %u too big, %u over budget; max indices/draw %u, max vertices/array %u",
+			     cl->id, cl->tex_bytes >> 10, cl->tex_peak >> 10, cl->tex_budget_kb, cl->tex_refused_size, cl->tex_refused_mem,
+			     cl->max_idx_count, cl->max_vcount);
 		snprintf(title, sizeof(title), "TGLBridge #%d %s %dx%d - %.1f fps", cl->id, cl->name, cl->w, cl->h,
 		         (cl->swaps - cl->swaps_last) / dt);
 		SetWindowTextA(cl->hwnd, title);
@@ -729,11 +825,20 @@ static void exec_cmd2(Client *cl, uint32_t op, unsigned char *p, uint32_t len)
 			cl->acap[id] = n;
 		}
 		memcpy(cl->abuf[id], q, n);
+		if ((unsigned int)count > cl->max_vcount) cl->max_vcount = (unsigned int)count;
 		swap_inplace((unsigned char *)cl->abuf[id], n, ts);
 		set_array_pointer(cl, id, size, type, (unsigned char *)cl->abuf[id] - (ptrdiff_t)first * ts * size);
 		return;
 	}
 	case OP_BYE: hlog("client %d: BYE", cl->id); cl->dead = 1; return;
+	case OP_STRICT:
+		cl->strict = rd_u32(&q); cl->max_tex = rd_u32(&q); cl->tex_budget_kb = rd_u32(&q);
+		if (!cl->max_tex) cl->max_tex = 2048;
+		hlog("client %d: STRICT mode 0x%x (lazy arrays %d, lazy indices %d, stride quirk tc/col %d xyz %d, limits %d: max tex %u, budget %u KB, canary %d, lag swap %d)",
+		     cl->id, cl->strict, !!(cl->strict & STRICT_LAZY_ARRAYS), !!(cl->strict & STRICT_LAZY_INDICES),
+		     !!(cl->strict & STRICT_STRIDE_TCCOL), !!(cl->strict & STRICT_STRIDE_XYZ), !!(cl->strict & STRICT_LIMITS),
+		     cl->max_tex, cl->tex_budget_kb, !!(cl->strict & STRICT_CANARY), !!(cl->strict & STRICT_LAG_SWAP));
+		return;
 	}
 	if (op < (uint32_t)TGLB_NSLOTS) {
 		if (manual(cl, (int)op, p, len)) return;
@@ -799,7 +904,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--shotdir") && i + 1 < argc) snprintf(g_shotdir, sizeof(g_shotdir), "%s", argv[++i]);
 		else if (!strcmp(argv[i], "--log") && i + 1 < argc) logpath = argv[++i];
 		else if (!strcmp(argv[i], "--exit-after") && i + 1 < argc) g_exit_after = atoi(argv[++i]);
-		else { fprintf(stderr, "usage: tglhost [--port N] [--hidden] [--shot a,b,c] [--shotdir dir] [--log file] [--exit-after N]\n"); return 1; }
+		else if (!strcmp(argv[i], "--shot-every") && i + 1 < argc) g_shot_every = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--shot-from") && i + 1 < argc) g_shot_from = atoi(argv[++i]);
+		else { fprintf(stderr, "usage: tglhost [--port N] [--hidden] [--shot a,b,c] [--shotdir dir] [--log file] [--exit-after N] [--shot-every N] [--shot-from S]\n"); return 1; }
 	}
 	g_log = fopen(logpath, "a");
 	CreateDirectoryA(g_shotdir, NULL);
